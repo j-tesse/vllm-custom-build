@@ -13,7 +13,7 @@
 #
 # Menu (see the case statement for per-config details & quantization notes):
 #   1  Qwen3.8-27B QAT-NVFP4      (110k ctx, bf16 KV; '1c'/'1k' = old unsloth PTQ)
-#   2  Qwen3.6-35B-A3B-NVFP4      (256k ctx, native MTP; custom image)
+#   2  K2-Horizon-MoVA-36B-A4B INT4 (cyankiwi AWQ; 44k ctx; needs image patches)
 #   3  DiffusionGemma-26B-A4B FP8   (20k ctx, block diffusion; '3n' = NVFP4)
 #   4  Gemma-4-31B-IT-NVFP4       (RedHatAI+MTP, 90k ctx + 24GB RAM KV tier; '4m' 105k no RAM tier, '4f' fp4 KV, '4mc' turbo text)
 #   5  Nemotron-3.5-Lightning-30B-A3B-NVFP4 (Mamba/MoE hybrid, native MTP)
@@ -302,7 +302,7 @@ function rec_config_for_container() {
     vllm_qwen_3_8_qat)           echo "1" ;;
     vllm_qwen_3_8_228k)          echo "1c" ;;
     vllm_qwen_3_8_bf16kv)        echo "1k" ;;
-    vllm_qwen3_6_35b_a3b_nvfp4)  echo "2" ;;
+    vllm_k2_horizon_mova_36b_int4) echo "2" ;;
     vllm_diffusiongemma_26b_fp8) echo "3" ;;
     vllm_diffusiongemma_26b_nvfp4) echo "3n" ;;
     vllm_gemma4-31b-nvfp4-mtp-ram) echo "4" ;;
@@ -391,9 +391,9 @@ function vllm() {
     echo -e "   ${GRAY}Qwen 3.8 27B hybrid-attention, QAT NVFP4 + bf16 lm_head${RESET}"
     echo -e "   ${GRAY}('1c'/'1k' = older unsloth PTQ quant: 228k ctx / bf16 KV @ 76k)${RESET}"
     echo ""
-    echo -e "${BOLD}2)${RESET} ${CYAN}Qwen3.6-35B-A3B-NVFP4${RESET}"
-    echo -e "   ${GRAY}256k context | MTP spec-decode | no offloading${RESET}"
-    echo -e "   ${GRAY}Qwen 3.6 MoE model (NVFP4), strong reasoning${RESET}"
+    echo -e "${BOLD}2)${RESET} ${CYAN}K2-Horizon-MoVA-36B-A4B (cyankiwi AWQ INT4)${RESET}"
+    echo -e "   ${GRAY}44k context | fp8 KV | ~130 tok/s | no spec-decode${RESET}"
+    echo -e "   ${GRAY}IFM MoE + mixture-of-value-experts attention, agentic/reasoning${RESET}"
     echo ""
     echo -e "${BOLD}3)${RESET} ${CYAN}DiffusionGemma-26B-A4B-FP8 (block diffusion)${RESET}"
     echo -e "   ${GRAY}20k context | ~385 tok/s | denoises a 256-token canvas per step${RESET}"
@@ -612,27 +612,94 @@ function vllm() {
       EXTRA=(--enable-prefix-caching --kv-cache-dtype bfloat16 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
     2)
-      # Qwen 3.6 35B-A3B MoE, NVFP4. MTP is native (draft layers built in), so
-      # --speculative-config needs no external drafter (unlike gemma4 4m/4f).
-      # compressed-tensors, NOT modelopt_fp4 (checkpoint advertises the former).
-      # --max-num-seqs 2: keeps CUDA-graph capture small; the default (~512) OOMs
-      #   during profiling (graph capture + NVFP4 weights + MTP draft layer).
-      # --max-num-batched-tokens 4096: hybrid (Mamba) model; Mamba block_size 2160
-      #   must be <= this, so it can't drop below ~2160.
-      # RESOLVED (2026-07-22): the vllm-custom rebuild ships a newer FlashInfer
-      #   whose fp8 prefill accepts the .run(kv_cache_sf=...) kwarg, so the crash
-      #   that hit MTP + fp8 KV is gone — confirmed on the 27B NVFP4 MTP configs
-      #   (options 1/1c). Not yet re-tested on this A3B checkpoint, but the
-      #   FlashInfer-version blocker no longer applies.
-      MODEL_ID="unsloth/Qwen3.6-35B-A3B-NVFP4"
+      # IFM K2-Horizon-MoVA-36B-A4B, cyankiwi AWQ INT4 (compressed-tensors
+      # pack-quantized, W4A16, group 32, asymmetric). Replaced Qwen3.6-35B-A3B-
+      # NVFP4 on 2026-09-28 (recover from git history if needed).
+      #
+      # NEEDS THE IMAGE PATCHES (b24+). MoVA = Mixture of Value experts: V comes from 64
+      # routed experts (top-4) per layer instead of a v_proj. Upstream only
+      # handles bf16 value experts; any INT4 checkpoint dies in profile_run with
+      # "'ColumnParallelLinear' object has no attribute 'weight'". The Dockerfile
+      # applies cyankiwi fork commit 46485cf572 (k2_horizon_mova_int4.patch),
+      # which keeps the experts packed 4-bit on the existing wna16 fused-MoE
+      # kernel, plus our k2_horizon_mova_int4_compile.patch (the fork alone dies
+      # under torch.compile; see the Dockerfile). UNMERGED fork code, not
+      # upstream-CI'd. Its author checked it against a bf16 reference (4.9e-4)
+      # on a different group-32 checkpoint. Here it has only been spot-checked on
+      # sm_120 (correct arithmetic, tool call, 42k needle), with no eval run.
+      #
+      # Quant contents: embeddings, lm_head, shared experts, both routers and
+      # layers 0-2 stay bf16 (~5.3 bits/param overall). Attention q/k/o ARE int4.
+      # Calibrated on STEM + agentic data.
+      #
+      # ---- SIZING (MEASURED b24, 2026-09-28, cold boot) ----
+      # Weights 22.7 GiB resident (checkpoint 22.6 GiB on disk; the fork's
+      # "26.58 GiB" figure was weights + non-torch and did NOT carry over here).
+      # All 48 layers are full attention, 8 KV heads x 128: fp8 KV = 96 KiB/token
+      # (vs ~3 KiB for config 5). No sliding window and no hybrid state, so the
+      # pool does NOT move with max_model_len (the same 4.09 GiB = 44,720 tokens
+      # at 24576 and at 44000 ctx). CONTEXT_SIZE 44000 = 1.02x. Idle 30.7 GiB used.
+      # Stress: a 33,041-token and then a 42,721-token needle prompt were answered
+      # correctly in 5.0s / 7.0s, with 0 restarts and 31.0 of 32.6 GiB used at
+      # peak. Decode ~131 tok/s (single stream, no spec-decode).
+      # Raising context means raising util (capped by laya, below) or
+      # --num-gpu-blocks-override. Lowering CONTEXT_SIZE frees nothing.
+      # GPU_MEM_UTIL 0.96: the laya container's ~500 MiB resident caps this
+      # at ~0.967 (see config 3). No --num-gpu-blocks-override: the profiled
+      # pool is what was stress-tested above.
+      # expandable_segments: reclaims fragmentation slack (as in config 3). No
+      # KV connector here, so nothing forbids it (unlike config 4).
+      #
+      # ---- FLAGS ----
+      # --reasoning-parser/--tool-call-parser k2_horizon: registered upstream.
+      #   The template's tool format (json/xml/xml_typed, default xml) is chosen
+      #   per request via chat_template_kwargs; the parser handles all three.
+      # --override-generation-config: generation_config.json ships NO sampling
+      #   defaults, but the card's results all use temperature 1.0 / top_p 0.95.
+      #   Without this, vLLM would fall back to top_p 1.0.
+      # ---- CLIENT REQUIREMENTS (hit by pi on 2026-09-28) ----
+      # (1) reasoning_effort: only high/medium/low. Anything else ('minimal',
+      #   'xhigh', ...) is a 400 from the reasoning parser. Only use 'high'
+      #   (the template default and the card's setting). At medium/low the model
+      #   sometimes closes with the high-level </ifm|think> instead of its own
+      #   </ifm|think_fast[er]>. The parser then files the whole answer as
+      #   reasoning and the client shows an empty reply, with no error.
+      # (2) FIXED SERVER-SIDE by --chat-template k2_horizon-patched.jinja
+      #   (~/scripts/chat-templates). The stock template raises "Assistant
+      #   message is missing a thinking field" whenever a replayed assistant
+      #   turn has no string reasoning field, which the OpenAI API does not
+      #   require. That was a 400 on turn 2 of every pi and OpenClaw tool loop.
+      #   The patch renders an empty think block instead; it is the only change
+      #   vs the checkpoint's chat_template.jinja. Re-diff if the checkpoint's
+      #   template is updated.
+      # (1) has NO server-side fix (the parser picks its end tag from the
+      #   request), so each client maps its thinking levels to "high":
+      #   thinkingLevelMap on this model's entry in ~/.pi/agent/models.json and
+      #   ~/.openclaw/openclaw.json. update-agent-models.sh preserves those fields.
+      # --max-num-batched-tokens 4096: caps the prefill activation peak, because
+      #   headroom is the scarce resource here.
+      # No MTP/drafter: the checkpoint ships none.
+      # --trust-remote-code: REQUIRED. Neither transformers 5.12.1 nor vLLM's
+      #   config registry knows model_type k2_horizon, so ModelConfig refuses to
+      #   start without it. It only executes the repo's configuration_k2_horizon.py
+      #   (a plain PreTrainedConfig dataclass, no I/O; audited 2026-09-28). The
+      #   model itself still runs on vLLM's native K2HorizonForCausalLM.
+      # --chat-template-content-format string: REQUIRED. vLLM auto-detects
+      #   'openai' (list-of-parts) for this template, but the template renders
+      #   message.content ONLY if it is a string and silently substitutes ''
+      #   otherwise. Every user message came through empty (prompt_tokens 10,
+      #   the model answering "??"), with no error. 'string' makes vLLM flatten
+      #   the parts first. Verify with /tokenize + messages after any change.
+      MODEL_ID="cyankiwi/K2-Horizon-MoVA-36B-A4B-AWQ-INT4"
       QUANTIZATION="compressed-tensors"
-      CONTEXT_SIZE=262144
+      CONTEXT_SIZE=44000
       INPUT_MODES="text"
-      DOCKER_NAME="vllm_qwen3_6_35b_a3b_nvfp4"
+      DOCKER_NAME="vllm_k2_horizon_mova_36b_int4"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.983
-      EXTRA=(--enable-prefix-caching --reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder --max-num-seqs 2 --max-num-batched-tokens 4096 --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
+      GPU_MEM_UTIL=0.96
+      ENV_ARGS=(--env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+      EXTRA=(--trust-remote-code --chat-template /etc/vllm/chat-templates/k2_horizon-patched.jinja --chat-template-content-format string --enable-prefix-caching --kv-cache-dtype fp8 --max-num-seqs 2 --max-num-batched-tokens 4096 --enable-auto-tool-choice --tool-call-parser k2_horizon --reasoning-parser k2_horizon --override-generation-config '{"temperature":1.0,"top_p":0.95}')
       ;;
     3|3n)
       # DiffusionGemma 26B-A4B — Google's BLOCK-DIFFUSION Gemma 4 MoE (25.2B total,

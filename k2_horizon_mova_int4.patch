@@ -1,0 +1,252 @@
+From 46485cf572920a2bbe55c1522f06237e9bc9aee0 Mon Sep 17 00:00:00 2001
+From: toncao <130689535+toncao@users.noreply.github.com>
+Date: Fri, 11 Sep 2026 10:14:22 +0000
+Subject: [PATCH] K2-Horizon: serve quantized MoVA value experts
+ (self_attn.v_experts.*)
+
+K2HorizonMoVAAttention builds v_experts as ColumnParallelLinear *with*
+quant_config, so a compressed-tensors checkpoint that quantizes
+self_attn.v_experts.* loads fine, but compute_mova_v_sparse then stacks
+`expert.weight`, which only exists on unquantized layers:
+
+  AttributeError: 'ColumnParallelLinear' object has no attribute 'weight'
+
+This aborts during profile_run, so any such checkpoint is unservable.
+
+Rather than dequantizing to bf16 (which would forfeit the memory saving --
+7.55B params, 4.25 GB int4 vs 15.1 GB bf16 for a 36B-A4B checkpoint), fold the
+packed experts once after load into the layout the existing use_int4_w4a16
+Triton/CUDA path already accepts:
+
+  w1       -> [E, N, K // 2] uint8, low nibble = even k
+  w1_scale -> [E, N, K // group]
+  w1_zp    -> [E, N // 2, K // group] uint8, packed along N
+
+compressed-tensors packs 8 values per int32 sequentially along K with
+little-endian nibbles and a +8 storage bias, so weight_packed viewed as uint8
+is already the required byte layout; only the zero points (packed along N)
+need unpacking and re-packing. Symmetric checkpoints pass w1_zp=None, whose
+default bias of 8 matches that same storage bias.
+
+The tile config is selected per call for this path: the wna16 CUDA/Triton
+choice is made from the actual token count, and the CUDA kernel caps
+BLOCK_SIZE_M at 64, so a config cached for max_num_batched_tokens aborts.
+
+Also fix _ensure_block_size_k_divisible, which could return a BLOCK_SIZE_K
+whose ratio to group_size is rejected by moe_wna16.cu (it requires
+BLOCK_SIZE_K // group_size in [1, 2, 4, 8]). It stepped through every multiple
+of group_size, so size_k=2560 with group_size=128 returned 640 (ratio 5), and
+the block growth heuristics could propose 512 with group_size=32 (ratio 16).
+Candidates are now exactly group_size * {8, 4, 2, 1}; already-legal inputs are
+unchanged. This mostly affects finer-grained (group_size=32) checkpoints.
+
+Verified on K2-Horizon-MoVA-36B-A4B-OmniQuant-INT4-DDP (group_size=32, asym):
+serves coherently, 26.58 GiB weights+non-torch for a 22.58 GiB checkpoint,
+confirming the experts stay packed. The converted kernel path matches a bf16
+dequantized reference to 4.9e-04 max abs on real checkpoint tensors.
+---
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index dc619b2b12d2..735a76834fa9 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -1178,7 +1178,8 @@ def _ensure_block_size_k_divisible(
+     """Ensure block_size_k is a divisor of size_k and divisible by group_size.
+ 
+     This ensures BLOCK_SIZE_K compatibility with MoeWNA16 CUDA kernel which
+-    requires size_k % BLOCK_SIZE_K == 0 and BLOCK_SIZE_K % group_size == 0.
++    requires size_k % BLOCK_SIZE_K == 0, BLOCK_SIZE_K % group_size == 0 and
++    BLOCK_SIZE_K // group_size in [1, 2, 4, 8].
+ 
+     Args:
+         size_k: The size_k dimension that must be divisible by result.
+@@ -1188,21 +1189,20 @@ def _ensure_block_size_k_divisible(
+     Returns:
+         A valid BLOCK_SIZE_K that divides size_k and is divisible by group_size.
+     """
+-    # Fast path: already valid
+-    if size_k % block_size_k == 0 and block_size_k % group_size == 0:
+-        return block_size_k
+-
+-    # Find the largest value that:
+-    # 1. Divides size_k (size_k % candidate == 0)
+-    # 2. Is divisible by group_size (candidate % group_size == 0)
+-    # 3. Is <= block_size_k (prefer smaller values close to block_size_k)
++    # The kernel only accepts BLOCK_SIZE_K // group_size in [1, 2, 4, 8], so
++    # candidates are exactly group_size * {8, 4, 2, 1}.  Searching every
++    # multiple of group_size instead can land on an illegal ratio (e.g.
++    # size_k=2560, group_size=128 -> 640, ratio 5), and the block growth
++    # heuristics in get_moe_wna16_block_config() can propose a block above the
++    # cap for small groups (e.g. 512 with group_size=32).  Both abort in
++    # moe_wna16_gemm; group_size=128 checkpoints usually stay legal, which is
++    # why this mainly shows up for finer-grained quantization.
+     #
+-    # Strategy: Search from min(block_size_k, size_k) down to group_size,
+-    # stepping by group_size to ensure divisibility by group_size
+-    max_search = min(block_size_k, size_k)
+-    start = (max_search // group_size) * group_size
+-    for candidate in range(start, group_size - 1, -group_size):
+-        if size_k % candidate == 0:
++    # Pick the largest legal candidate that divides size_k and does not exceed
++    # the preferred block_size_k.
++    for ratio in (8, 4, 2, 1):
++        candidate = group_size * ratio
++        if candidate <= block_size_k and size_k % candidate == 0:
+             return candidate
+ 
+     # Fallback: if group_size divides size_k, use it
+diff --git a/vllm/model_executor/models/k2_horizon.py b/vllm/model_executor/models/k2_horizon.py
+index 47e87c0dcb62..0ad6abeb88f9 100644
+--- a/vllm/model_executor/models/k2_horizon.py
++++ b/vllm/model_executor/models/k2_horizon.py
+@@ -797,6 +797,90 @@ def __init__(
+             block_shape=None,
+         )
+ 
++        # Populated by pack_quantized_v_experts() when the checkpoint stores the
++        # MoVA value experts in compressed-tensors packed-int4 form.
++        self._mova_w1_shape = w1_shape
++        self._mova_config_M = vllm_config.scheduler_config.max_num_batched_tokens
++        self._mova_config_dtype = vllm_config.model_config.dtype
++        self.v_experts_qweight: torch.Tensor | None = None
++        self.v_experts_scale: torch.Tensor | None = None
++        self.v_experts_zp: torch.Tensor | None = None
++        self.v_experts_group_size: int | None = None
++
++    def pack_quantized_v_experts(self) -> bool:
++        """Fold packed-int4 MoVA value experts into fused-MoE kernel layout.
++
++        ``compute_mova_v_sparse`` stacks ``expert.weight``, which only exists on
++        unquantized layers.  When the checkpoint quantizes
++        ``self_attn.v_experts.*`` (compressed-tensors ``pack-quantized``), each
++        expert instead carries ``weight_packed`` / ``weight_scale`` /
++        ``weight_zero_point``.  Rather than dequantizing to bf16 (which would
++        forfeit the memory saving), convert once into the layout the existing
++        ``use_int4_w4a16`` Triton path already understands:
++
++          * ``w1``       -> ``[E, N, K // 2]`` uint8, low nibble = even k
++          * ``w1_scale`` -> ``[E, N, K // group]``
++          * ``w1_zp``    -> ``[E, N // 2, K // group]`` uint8, packed along N
++
++        compressed-tensors packs 8 values per int32 sequentially along K with
++        little-endian nibbles and a +8 storage bias, so ``weight_packed`` viewed
++        as uint8 is already the required byte layout; only the zero points
++        (packed along N) need unpacking and re-packing.
++
++        Returns True when a conversion happened.  Must run after weight loading
++        and before ``process_weights_after_loading``, since it consumes the raw
++        checkpoint parameters and then drops the per-expert modules.
++        """
++        if self.v_experts is None or len(self.v_experts) == 0:
++            return False
++        if hasattr(self.v_experts[0], "weight"):
++            return False  # unquantized: keep the existing bf16 stacking path
++        if not hasattr(self.v_experts[0], "weight_packed"):
++            raise ValueError(
++                "MoVA v_experts are neither unquantized nor compressed-tensors "
++                "packed-int4; this quantization format is not supported."
++            )
++
++        from compressed_tensors.compressors.pack_quantized.helpers import (
++            unpack_from_int32,
++        )
++
++        E = len(self.v_experts)
++        N = self.kv_size
++        qweights, scales, zps = [], [], []
++        group_size = None
++        for expert in self.v_experts:
++            packed = expert.weight_packed.data
++            scale = expert.weight_scale.data
++            K = packed.shape[1] * 8
++            if group_size is None:
++                group_size = K // scale.shape[1]
++            # int32 nibbles (k = 8m..8m+7, little-endian) == uint8 [N, K // 2]
++            qweights.append(packed.contiguous().view(torch.uint8).view(N, K // 2))
++            scales.append(scale.to(self._mova_config_dtype))
++
++            zp = getattr(expert, "weight_zero_point", None)
++            if zp is not None:
++                # zero points are packed 8-per-int32 along N (packed_dim=0)
++                zp_u = unpack_from_int32(
++                    zp.data, 4, torch.Size([N, K // group_size]), packed_dim=0
++                )
++                zp_u = (zp_u.to(torch.int16) + 8).clamp(0, 15).to(torch.uint8)
++                zps.append(zp_u[1::2, :] * 16 + zp_u[0::2, :])
++
++        self.v_experts_qweight = torch.stack(qweights, dim=0).contiguous()
++        self.v_experts_scale = torch.stack(scales, dim=0).contiguous()
++        # Symmetric checkpoints need no zero point: the kernel's default bias of
++        # 8 already matches the +8 storage bias used by compressed-tensors.
++        self.v_experts_zp = (
++            torch.stack(zps, dim=0).contiguous() if len(zps) == E else None
++        )
++        self.v_experts_group_size = group_size
++        # Drop the per-expert modules so their weights are freed and their quant
++        # methods do not re-process (e.g. repack) tensors we have consumed.
++        self.v_experts = None
++        return True
++
+     def compute_mova_v_sparse(self, hidden_states):
+         router_logits, _ = self.v_router(hidden_states)
+ 
+@@ -808,6 +892,45 @@ def compute_mova_v_sparse(self, hidden_states):
+             scaling_factor=self.router_scaling_factor,
+         )
+ 
++        if self.v_experts_qweight is not None:
++            block_shape = [0, self.v_experts_group_size]
++            # The wna16 CUDA/Triton choice is made per call from the actual
++            # token count, and the CUDA kernel caps BLOCK_SIZE_M at 64, so the
++            # tile config must be selected per call rather than cached for
++            # max_num_batched_tokens (as the unquantized path can do).
++            config = try_get_optimal_moe_config(
++                w1_shape=self._mova_w1_shape,
++                w2_shape=torch.Size(
++                    [
++                        self._mova_w1_shape[0],
++                        self._mova_w1_shape[2],
++                        self._mova_w1_shape[1],
++                    ]
++                ),
++                top_k=self.num_experts_per_tok,
++                dtype=_get_config_dtype_str(
++                    use_fp8_w8a8=False,
++                    use_int8_w8a16=False,
++                    use_int4_w4a16=True,
++                    dtype=self._mova_config_dtype,
++                ),
++                M=hidden_states.size(0),
++                block_shape=block_shape,
++            )
++            return fused_mova_impl(
++                config=config,
++                hidden_states=hidden_states.contiguous(),
++                w1=self.v_experts_qweight,
++                topk_weights=routing_weights.contiguous(),
++                topk_ids=selected_values.contiguous(),
++                use_int4_w4a16=True,
++                w1_scale=self.v_experts_scale,
++                w1_zp=self.v_experts_zp,
++                block_shape=block_shape,
++                global_num_experts=self.num_experts,
++                expert_map=None,
++            )
++
+         w1 = torch.stack(
+             [expert.weight for expert in self.v_experts], dim=0
+         ).contiguous()
+@@ -1439,7 +1562,13 @@ def compute_logits(
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(weights)
++        loaded = loader.load_weights(weights)
++        # Checkpoints may quantize self_attn.v_experts.*; fold them into the
++        # fused-MoE int4 layout before quant methods post-process the layers.
++        for module in list(self.modules()):
++            if isinstance(module, K2HorizonMoVAAttention):
++                module.pack_quantized_v_experts()
++        return loaded
+ 
+     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+         return self.model.get_expert_mapping()

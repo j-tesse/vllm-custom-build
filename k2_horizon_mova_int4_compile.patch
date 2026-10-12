@@ -1,0 +1,162 @@
+--- a/vllm/model_executor/models/k2_horizon.py
++++ b/vllm/model_executor/models/k2_horizon.py
+@@ -102,6 +102,7 @@
+ )
+ from vllm.sequence import IntermediateTensors
+ from vllm.triton_utils import tl
++from vllm.utils.torch_utils import direct_register_custom_op
+ 
+ logger = init_logger(__name__)
+ 
+@@ -277,6 +278,78 @@
+     return out_hidden_states
+ 
+ 
++def _k2_horizon_mova_int4(
++    hidden_states: torch.Tensor,
++    qweight: torch.Tensor,
++    scale: torch.Tensor,
++    zp: torch.Tensor | None,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    group_size: int,
++    num_experts: int,
++    hidden_size: int,
++) -> torch.Tensor:
++    """Quantized MoVA value projection, run OUTSIDE the compiled graph.
++
++    The int4 tile config must be chosen from the real token count per call
++    (the wna16 CUDA/Triton split and the CUDA kernel's BLOCK_SIZE_M <= 64 cap
++    both depend on M). try_get_optimal_moe_config reads JSON config files and
++    queries NVML, which Dynamo cannot trace under vLLM's fullgraph compile
++    ("Dynamo does not know how to trace method `__call__` of class
++    `_FuncPtr`"), so the whole thing is an opaque custom op.
++    """
++    _, N, _ = qweight.shape
++    w1_shape = torch.Size([num_experts, N, hidden_size])
++    block_shape = [0, group_size]
++    config = try_get_optimal_moe_config(
++        w1_shape=w1_shape,
++        w2_shape=torch.Size([num_experts, hidden_size, N]),
++        top_k=topk_ids.size(1),
++        dtype=_get_config_dtype_str(
++            use_fp8_w8a8=False,
++            use_int8_w8a16=False,
++            use_int4_w4a16=True,
++            dtype=hidden_states.dtype,
++        ),
++        M=hidden_states.size(0),
++        block_shape=block_shape,
++    )
++    return fused_mova_impl(
++        config=config,
++        hidden_states=hidden_states.contiguous(),
++        w1=qweight,
++        topk_weights=topk_weights.contiguous(),
++        topk_ids=topk_ids.contiguous(),
++        use_int4_w4a16=True,
++        w1_scale=scale,
++        w1_zp=zp,
++        block_shape=block_shape,
++        global_num_experts=num_experts,
++        expert_map=None,
++    )
++
++
++def _k2_horizon_mova_int4_fake(
++    hidden_states: torch.Tensor,
++    qweight: torch.Tensor,
++    scale: torch.Tensor,
++    zp: torch.Tensor | None,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    group_size: int,
++    num_experts: int,
++    hidden_size: int,
++) -> torch.Tensor:
++    return hidden_states.new_empty((hidden_states.size(0), qweight.size(1)))
++
++
++direct_register_custom_op(
++    op_name="k2_horizon_mova_int4",
++    op_func=_k2_horizon_mova_int4,
++    fake_impl=_k2_horizon_mova_int4_fake,
++)
++
++
+ class K2HorizonRMSNorm(RMSNorm):
+     def __init__(self, hidden_size: int, n_groups: int, eps: float = 1e-6):
+         assert hidden_size % n_groups == 0
+@@ -802,10 +875,14 @@
+         self._mova_w1_shape = w1_shape
+         self._mova_config_M = vllm_config.scheduler_config.max_num_batched_tokens
+         self._mova_config_dtype = vllm_config.model_config.dtype
+-        self.v_experts_qweight: torch.Tensor | None = None
+-        self.v_experts_scale: torch.Tensor | None = None
+-        self.v_experts_zp: torch.Tensor | None = None
++        # Non-persistent buffers, not plain attributes: under torch.compile a
++        # plain tensor attribute can be baked into the graph as a constant,
++        # while buffers are lifted as graph inputs like any other weight.
++        self.register_buffer("v_experts_qweight", None, persistent=False)
++        self.register_buffer("v_experts_scale", None, persistent=False)
++        self.register_buffer("v_experts_zp", None, persistent=False)
+         self.v_experts_group_size: int | None = None
++        self._mova_hidden_size = hidden_size
+ 
+     def pack_quantized_v_experts(self) -> bool:
+         """Fold packed-int4 MoVA value experts into fused-MoE kernel layout.
+@@ -893,42 +970,18 @@
+         )
+ 
+         if self.v_experts_qweight is not None:
+-            block_shape = [0, self.v_experts_group_size]
+-            # The wna16 CUDA/Triton choice is made per call from the actual
+-            # token count, and the CUDA kernel caps BLOCK_SIZE_M at 64, so the
+-            # tile config must be selected per call rather than cached for
+-            # max_num_batched_tokens (as the unquantized path can do).
+-            config = try_get_optimal_moe_config(
+-                w1_shape=self._mova_w1_shape,
+-                w2_shape=torch.Size(
+-                    [
+-                        self._mova_w1_shape[0],
+-                        self._mova_w1_shape[2],
+-                        self._mova_w1_shape[1],
+-                    ]
+-                ),
+-                top_k=self.num_experts_per_tok,
+-                dtype=_get_config_dtype_str(
+-                    use_fp8_w8a8=False,
+-                    use_int8_w8a16=False,
+-                    use_int4_w4a16=True,
+-                    dtype=self._mova_config_dtype,
+-                ),
+-                M=hidden_states.size(0),
+-                block_shape=block_shape,
+-            )
+-            return fused_mova_impl(
+-                config=config,
+-                hidden_states=hidden_states.contiguous(),
+-                w1=self.v_experts_qweight,
+-                topk_weights=routing_weights.contiguous(),
+-                topk_ids=selected_values.contiguous(),
+-                use_int4_w4a16=True,
+-                w1_scale=self.v_experts_scale,
+-                w1_zp=self.v_experts_zp,
+-                block_shape=block_shape,
+-                global_num_experts=self.num_experts,
+-                expert_map=None,
++            # Opaque custom op: the per-call int4 tile-config lookup is not
++            # traceable by Dynamo (see _k2_horizon_mova_int4).
++            return torch.ops.vllm.k2_horizon_mova_int4(
++                hidden_states,
++                self.v_experts_qweight,
++                self.v_experts_scale,
++                self.v_experts_zp,
++                routing_weights,
++                selected_values,
++                self.v_experts_group_size,
++                self.num_experts,
++                self._mova_hidden_size,
+             )
+ 
+         w1 = torch.stack(
