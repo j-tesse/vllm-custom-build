@@ -19,6 +19,11 @@ WORKDIR /workspace/vllm-build
 # Remove old vLLM (keep PyTorch and all other CUDA libs)
 RUN pip uninstall -y vllm vllm-flash-attn flashinfer-cubin flashinfer-jit-cache 2>/dev/null || true
 
+# elfutils headers: DeepGEMM's deep_jit includes <elfutils/libdwfl.h> (upstream
+# #56876 added elfutils-devel to its build stage). Without it deepgemm_C fails.
+RUN apt-get update && apt-get install -y --no-install-recommends libdw-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Build tools (setuptools_rust imported at setup.py module load; see 26.03 notes).
 RUN pip install --no-cache-dir setuptools wheel cmake ninja packaging setuptools_scm setuptools_rust
 
@@ -126,6 +131,35 @@ RUN pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
     python3 -c "import inspect, flashinfer; from flashinfer import BatchPrefillWithPagedKVCacheWrapper as W; assert 'kv_cache_sf' in inspect.signature(W.run).parameters, 'FlashInfer run() is missing kv_cache_sf — version skew with vLLM main'" && \
     python3 -c "import inspect; from flashinfer.decode import xqa_batch_decode_with_kv_cache as f; assert 'q_cu_seq_lens' in inspect.signature(f).parameters, 'FlashInfer xqa_batch_decode_with_kv_cache() is missing q_cu_seq_lens — version skew with vLLM main'" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
+
+# K2-Horizon MoVA INT4 (vllm.sh `2`): cyankiwi fork commit 46485cf572 minus its
+# test file. Upstream k2_horizon.py stacks `expert.weight` for the MoVA value
+# experts, which only exists unquantized, so every INT4 checkpoint dies in
+# profile_run with "'ColumnParallelLinear' object has no attribute 'weight'".
+# The patch folds the compressed-tensors packed experts into the existing
+# use_int4_w4a16 fused-MoE layout (they stay 4-bit) and fixes
+# _ensure_block_size_k_divisible for group_size=32. Upstream's equivalent
+# (#56637) is Intel-only, hence the fork.
+# k2_horizon_mova_int4_compile.patch is OURS, layered on top. It moves the fork's
+# quantized path into an opaque custom op (torch.ops.vllm.k2_horizon_mova_int4).
+# The fork picks the int4 tile config per call via try_get_optimal_moe_config,
+# which reads JSON + calls NVML, and so is untraceable under vLLM's fullgraph
+# compile: EngineCore died in profile_run with "Dynamo does not know how to
+# trace method `__call__` of class `_FuncPtr`" (the fork was evidently only
+# run eager). It also makes the packed tensors buffers, so they are not
+# baked into the graph as constants.
+# Applied HERE, against site-packages, not in the builder: both files are pure
+# Python, so the builder (the ~60-min CUDA compile) stays cache-hittable.
+# `--forward` fails the build on a reject OR on "already applied". When
+# upstream merges a fix, drop this block rather than forcing it.
+COPY k2_horizon_mova_int4.patch k2_horizon_mova_int4_compile.patch /tmp/
+RUN cd /usr/local/lib/python3.12/dist-packages && \
+    patch -p1 --forward --no-backup-if-mismatch < /tmp/k2_horizon_mova_int4.patch && \
+    patch -p1 --forward --no-backup-if-mismatch < /tmp/k2_horizon_mova_int4_compile.patch && \
+    rm /tmp/k2_horizon_mova_int4*.patch && \
+    grep -q 'def pack_quantized_v_experts' vllm/model_executor/models/k2_horizon.py && \
+    grep -q 'torch.ops.vllm.k2_horizon_mova_int4(' vllm/model_executor/models/k2_horizon.py && \
+    python3 -c "import vllm.model_executor.models.k2_horizon; from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32"
 
 # openai: NO pin needed — 26.06 ships 2.44.0, which has NamespaceTool (added in
 # 2.25.0). The 26.03 Dockerfile pinned openai==2.45.0 for exactly this symbol;

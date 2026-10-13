@@ -37,6 +37,7 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | `Dockerfile` | 2-stage Dockerfile, base `26.06-py3` (see below) |
 | `Dockerfile.26.03` | Archived previous 3-stage build (driver-580.x era); kept for reference/rollback |
 | `PLAN-base-26.06.md` | Base-bump plan + measured dependency audit |
+| `k2_horizon_mova_int4.patch`, `k2_horizon_mova_int4_compile.patch` | Fork patch + our torch.compile fix, applied to site-packages in the runtime stage; let `vllm.sh 2` serve INT4 MoVA value experts. See below |
 | `vllm/` | vLLM source, tracked as a **git submodule** → `github.com/vllm-project/vllm` (pins the built commit) |
 | `vllm.sh` | Interactive Docker model menu (aliased as `vllm`); launches model containers from `vllm-custom:latest` |
 | `build.number` | Persisted monotonic build counter; `build.sh` increments it (on success only) and tags the image `vllm-custom:b<N>` |
@@ -55,6 +56,12 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 Because we build bleeding-edge source on a base tuned for 0.22.1, these stay pinned (guards fail-fast if a symbol/torch regresses): `transformers==5.12.1`, `xgrammar==0.2.3`, `flashinfer-python/-cubin==0.6.18` (+`--extra-index-url https://flashinfer.ai/whl/`), `compressed-tensors==0.17.0`, `humming-kernels==0.1.10`, `tokenspeed-mla==0.1.8`, `tilelang==0.1.9`, `nvidia-cutlass-dsl==4.6.0` + `quack-kernels==0.6.1` (matched cute-DSL pair), `apache-tvm-ffi==0.1.10`, `nvidia-cudnn-frontend>=1.19.1`, `mistral_common>=1.11.5`. The base bump **dropped** the previously-needed `openai` and `fastsafetensors` pins (26.06 satisfies them natively).
 
 **The flashinfer pin tracks `vllm/requirements/cuda.txt` — diff it on every update.** It is the one pin upstream moves *for* us, and a stale one is not caught by the build: b19 (2026-09-04) built clean against 0.6.14 while source had moved to 0.6.18, then crash-looped every config at cudagraph capture with `TypeError: xqa_batch_decode_with_kv_cache() got an unexpected keyword argument 'q_cu_seq_lens'`. The XQA decode path is gated on `is_device_capability_family(120)`, so it is **sm_120 / this box only** — upstream CI does not cover it, and the failure surfaces at *runtime on the first model start*, not at build time. The `RUN` block now guards `q_cu_seq_lens` alongside `kv_cache_sf`; add a guard for whatever kwarg the next skew lands on rather than trusting the version number.
+
+### K2-Horizon MoVA INT4 patch (`vllm.sh 2`, added 2026-09-28)
+Upstream `k2_horizon.py` supports only bf16 MoVA value experts (`self_attn.v_experts.*`). Every INT4 checkpoint dies in `profile_run` with `'ColumnParallelLinear' object has no attribute 'weight'`. `k2_horizon_mova_int4.patch` is cyankiwi fork commit `46485cf572` minus its test file. It folds compressed-tensors packed experts into the existing `use_int4_w4a16` fused-MoE layout, and fixes `_ensure_block_size_k_divisible` for group_size 32. Upstream's #56637 is Intel-only.
+- `k2_horizon_mova_int4_compile.patch` is ours and applies on top of the fork patch. The fork picks its int4 tile config per call (`try_get_optimal_moe_config`: JSON reads + NVML), which Dynamo can't trace under vLLM's fullgraph compile, so EngineCore died in profile_run (`_FuncPtr.__call__`). The fix moves that path into the opaque custom op `torch.ops.vllm.k2_horizon_mova_int4`. Validated on b24 (2026-09-28).
+- Applied with `patch --forward` against **site-packages in the runtime stage**, not in the builder. Both files are pure Python, and this placement lets a patch-only change reuse the cached builder layers (the CUDA compile).
+- **On a `vllm/` update the patch may reject, and the build then fails loudly (intended).** Check whether upstream has merged an equivalent first. If it has, delete the block and the patch file. If it hasn't, rebase both patches onto the new source.
 
 ## Transformers pin (load-bearing) & Gemma 4 MTP
 
