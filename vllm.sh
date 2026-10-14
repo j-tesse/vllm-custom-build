@@ -879,6 +879,21 @@ function vllm() {
       # 0.3s vs 47.6s re-prefill. Correctness: needle test (~60k prompt; answer
       # from computed KV vs from RAM-reloaded KV) matched exactly.
       #
+      # RE-VALIDATED on b26 (2026-10-13) with num_speculative_tokens 5: same
+      # 101,088 tokens, idle 30,614 MiB, stress peak 31,698 MiB (172 MiB below
+      # b21), 0 OOM / 0 restarts. 86,403-token needle prompt: cold prefill 23.4s
+      # (b26 prefill ~2x b21), RAM reload 0.46s (86,368 external-hit tokens),
+      # needle exact on computed, GPU-cached and RAM-reloaded KV.
+      #
+      # num_speculative_tokens 5 (was 4, inherited untuned). Sweep on b26, 12
+      # req x <=1024 tok, token-weighted decode tok/s (/tmp harness, not
+      # bench-inference.ts — its 4 short prompts are skewed by an 8-token reply
+      # and by output text changing with k):
+      #   k=4 144.4 (accept len 3.30)  k=5 149.8 (3.55, +3.7%)  k=6 148.5 (3.64)
+      # Per-position acceptance decays ~0.8x per position (k=6: .78 .58 .44 .35
+      # .28 .21), so past 5 the extra drafter pass costs what it gains. Gains are
+      # on code/math (+7-10%); creative prose is flat to slightly worse.
+      #
       # History — at 6780 (4m's value) it FAILED: booted fine (idle 31,260 MiB)
       # but the first ~86k-token prompt killed the engine with the SAME 168 MiB
       # prefill-buffer OOM as 4m's 2026-09-09 crash
@@ -927,6 +942,9 @@ function vllm() {
       # `block_hash is None`), so a prefix seen only once never reaches RAM.
       # Multi-turn chat re-sends the history every turn, so earlier turns
       # qualify quickly; a one-off long prompt never will.
+      # b26 (2026-10-13): send 2 of an 86k prompt was already a full GPU prefix
+      # hit, so the "send 3" behaviour above looks fixed upstream. Untested
+      # whether a once-seen prefix now reaches RAM (stress test sent it twice).
       #
       # SIZING: MEASURED 19,660 CPU blocks for 24 GiB — bytes / bytes-per-block,
       # so independent of the GPU override — ~3.1x the 6400-block GPU pool
@@ -965,7 +983,7 @@ function vllm() {
       CPU_OFFLOAD=0
       GPU_MEM_UTIL=0.982
       ENV_ARGS=(--ulimit memlock=-1:-1)
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
       ;;
     4m)
       # RedHatAI Gemma 4 31B NVFP4 + MTP speculative decoding via Google's drafter
