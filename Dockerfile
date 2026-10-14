@@ -63,44 +63,61 @@ RUN pip uninstall -y vllm vllm-flash-attn flashinfer-cubin flashinfer-jit-cache 
 COPY --from=builder /workspace/vllm-build/dist/*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps /tmp/*.whl && rm /tmp/*.whl
 
-# transformers: 26.06 ships 5.6.0; keep 5.12.1 for Gemma 4 MTP (drafter
-# model_type `gemma4_assistant`, only recognized by transformers 5.12.x). See 4m.
-RUN pip install --no-cache-dir transformers==5.12.1
+# transformers: 26.06 ships 5.6.0. Gemma 4 MTP needs >=5.12 (drafter model_type
+# `gemma4_assistant`); source requires >=5.16.1,<5.20 since b26. Guard the
+# drafter's model_type so a future bump can't silently drop it.
+RUN pip install --no-cache-dir transformers==5.19.0 && \
+    python3 -c "from transformers.models.auto.configuration_auto import CONFIG_MAPPING; assert 'gemma4_assistant' in CONFIG_MAPPING"
 
-# Kernel/quant runtime deps that source 1214 needs NEWER than 26.06's vLLM 0.22.1
-# baseline (measured in PLAN-base-26.06.md). --no-deps wheel install left the
-# base's older versions in place, so pin explicitly to match requirements/*.txt.
+# Runtime deps that source needs NEWER than 26.06's vLLM 0.22.1 baseline.
+# --no-deps wheel install leaves the base's older versions in place, so pin
+# explicitly to match vllm/requirements/{common,cuda}.txt. AUDIT ON EVERY UPDATE
+# (b25 shipped humming 0.1.10 vs source's 0.1.16 → every config crash-looped at
+# config load on `humming.dtypes.float4e0m3`). Audit snippet: run a script that
+# checks packaging.Requirement(line).specifier against importlib.metadata for
+# each line of both files inside the built image; ignore torch/torchvision/
+# torchaudio/torchcodec/PyNvVideoCodec (NVIDIA torch stays) and numba patch skew.
 RUN pip install --no-cache-dir \
-    'humming-kernels[cu13]==0.1.10' \
-    tokenspeed-mla==0.1.8 \
-    tilelang==0.1.9 \
+    'humming-kernels[cu13]==0.1.16' \
+    tokenspeed-mla==0.2.15 \
+    tilelang==0.1.12 \
     compressed-tensors==0.17.0 \
-    apache-tvm-ffi==0.1.10 \
+    apache-tvm-ffi==0.1.11 \
     'nvidia-cudnn-frontend>=1.19.1' \
-    'mistral_common[image]>=1.11.5'
+    'mistral_common[image]>=1.11.6' \
+    'huggingface_hub>=1.31.0' \
+    'tokenizers>=0.23.2' \
+    'aiohttp>=3.14.3' \
+    'pillow>=12.3.0' \
+    'oss-harmony>=0.0.11' \
+    'mcp>=2.0.0,<3.0.0' \
+    'fastsafetensors>=0.3.3' \
+    'instanttensor>=0.1.9' \
+    nvtx==0.2.15 && \
+    python3 -c "import humming.dtypes as d; d.float4e0m3"
 
-# xgrammar: 26.06 ships 0.2.0 (< 0.2.1, lacks normalize_tool_choice). Keep 0.2.3.
-RUN pip install --no-cache-dir xgrammar==0.2.3 && \
+# xgrammar: 26.06 ships 0.2.0 (< 0.2.1, lacks normalize_tool_choice).
+RUN pip install --no-cache-dir xgrammar==0.2.8 && \
     python3 -c "from xgrammar import StructuralTag, normalize_tool_choice" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
 # cute-DSL FA4 stack (the 26.03 blocker fix, cleaner here). 26.06 ships
-# cutlass-dsl 4.5.2 + quack 0.4.1; source now pins nvidia-cutlass-dsl==4.6.2 +
-# quack-kernels==0.6.4 (was 4.6.0/0.6.1). These two move together — quack 0.6.4
-# declares `nvidia-cutlass-dsl==4.6.2` exactly, as 0.6.1 declared 4.6.0 — so
+# cutlass-dsl 4.5.2 + quack 0.4.1; source now pins nvidia-cutlass-dsl==4.8.0 +
+# quack-kernels==0.6.5 (b26). These two move together — each quack release
+# declares an exact cutlass-dsl version — so
 # bump them as a pair, from `vllm/requirements/cuda.txt`, never one alone.
 # quack's layout_utils no longer references the removed cutlass.cute.core.ThrMma
 # symbol (verified import-clean on 26.06, 2026-07-17). The guard imports the
 # exact modules vLLM's cute-DSL kernel warmup pulls in (quack.compile_utils /
 # quack.layout_utils), which is what crash-looped EngineCore on the mismatched
 # 26.03 pair.
-RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.2' quack-kernels==0.6.4 && \
+RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.8.0' quack-kernels==0.6.5 && \
     python3 -c "from quack.compile_utils import make_fake_tensor; import quack.layout_utils" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
 # flashinfer: 26.06 ships 0.6.12. Keep this pin equal to `vllm/requirements/
-# cuda.txt` — it moves with source (0.6.14 → 0.6.18 upstream 7ab29234890,
-# 2026-08-30). cubin left PyPI at 0.6.14 → needs flashinfer's own index
+# cuda.txt` — it moves with source (0.6.14 → 0.6.18 2026-08-30; → 0.7.0.post1
+# at b26). cubin left PyPI at 0.6.14 → needs flashinfer's own index
 # (--extra-index-url).
 #
 # TWO guards, both for real skew we have shipped:
@@ -114,8 +131,8 @@ RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.2' quack-kernels==
 #     cover it for us. Import from flashinfer.decode, the same module vLLM's
 #     _lazy_import_wrapper uses; it is not re-exported at package top level.
 #
-# The `nvidia-cutlass-dsl[cu13]==4.6.2` repeat is load-bearing, NOT redundant
-# with the block above. flashinfer 0.6.18 requires `nvidia-cutlass-dsl>=4.6.2a0`
+# The `nvidia-cutlass-dsl[cu13]` repeat is load-bearing, NOT redundant with the
+# block above. flashinfer 0.6.18 required `nvidia-cutlass-dsl>=4.6.2a0`
 # — the `a0` suffix makes pip accept PRE-RELEASES for it, and the flashinfer
 # extra-index serves `4.8.0.dev0`. Without the repeat, this step silently
 # upgrades the cute-DSL pin installed above to that dev build, whose _mlir libs
@@ -124,9 +141,9 @@ RUN pip install --no-cache-dir 'nvidia-cutlass-dsl[cu13]==4.6.2' quack-kernels==
 # 'OpOperands'" (hit on the first 0.6.18 build, 2026-09-04). Pinning here makes
 # pip resolve both in one pass and fail loudly on a real conflict instead.
 RUN pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
-        flashinfer-python==0.6.18 flashinfer-cubin==0.6.18 \
-        'nvidia-cutlass-dsl[cu13]==4.6.2' && \
-    python3 -c "import importlib.metadata as m; v = m.version('nvidia-cutlass-dsl'); assert v == '4.6.2', f'cute-DSL pin was clobbered by a flashinfer dep: {v}'" && \
+        flashinfer-python==0.7.0.post1 flashinfer-cubin==0.7.0.post1 \
+        'nvidia-cutlass-dsl[cu13]==4.8.0' && \
+    python3 -c "import importlib.metadata as m; v = m.version('nvidia-cutlass-dsl'); assert v == '4.8.0', f'cute-DSL pin was clobbered by a flashinfer dep: {v}'" && \
     python3 -c "from quack.compile_utils import make_fake_tensor; import quack.layout_utils" && \
     python3 -c "import inspect, flashinfer; from flashinfer import BatchPrefillWithPagedKVCacheWrapper as W; assert 'kv_cache_sf' in inspect.signature(W.run).parameters, 'FlashInfer run() is missing kv_cache_sf — version skew with vLLM main'" && \
     python3 -c "import inspect; from flashinfer.decode import xqa_batch_decode_with_kv_cache as f; assert 'q_cu_seq_lens' in inspect.signature(f).parameters, 'FlashInfer xqa_batch_decode_with_kv_cache() is missing q_cu_seq_lens — version skew with vLLM main'" && \
