@@ -17,6 +17,7 @@
 #   3  DiffusionGemma-26B-A4B FP8   (20k ctx, block diffusion; '3n' = NVFP4)
 #   4  Gemma-4-31B-IT-NVFP4       (RedHatAI+MTP, 90k ctx + 24GB RAM KV tier; '4m' 105k no RAM tier, '4f' fp4 KV, '4mc' turbo text)
 #   5  Nemotron-3.5-Lightning-30B-A3B-NVFP4 (Mamba/MoE hybrid, native MTP)
+#   6  Nemotron-3.5-Bolt-74B-A9B-24GB (2-bit QAT, vision, LiLiCorr DFlash; 262k; needs b27+)
 #
 # Control verbs are WORDS, never numbers. The old numeric 5/6/7 (logs/test/stop)
 # were retired when Nemotron took slot 5 — a digit now always means "start a
@@ -310,6 +311,7 @@ function rec_config_for_container() {
     vllm_gemma4-31b-nvfp4-mtp-hc) echo "4mc" ;;
     vllm_gemma4-31b-nvfp4-mtp-fp4kv) echo "4f" ;;
     vllm_nemotron35_lightning_30b_a3b) echo "5" ;;
+    vllm_nemotron35_bolt_74b_a9b) echo "6" ;;
     *) return 1 ;;
   esac
 }
@@ -410,13 +412,17 @@ function vllm() {
     echo -e "   ${GRAY}256k context | fp8 KV cache | native MTP spec-decode${RESET}"
     echo -e "   ${GRAY}NVIDIA Mamba-2/MoE hybrid, 3B active of 30B (text-only)${RESET}"
     echo ""
+    echo -e "${BOLD}6)${RESET} ${CYAN}Nemotron-3.5-Bolt-74B-A9B-24GB (2-bit QAT)${RESET}"
+    echo -e "   ${GRAY}262k context (1.28x) | fp8 KV | LiLiCorr DFlash spec-decode, ~350 tok/s${RESET}"
+    echo -e "   ${GRAY}NVIDIA Mamba-2/LatentMoE hybrid, 9B active of 74B, text+image${RESET}"
+    echo ""
     echo -e "${BOLD}l)${RESET} ${YELLOW}Show live logs of running container${RESET}"
     echo ""
     echo -e "${BOLD}t)${RESET} ${GREEN}Test inference with running model${RESET}"
     echo ""
     echo -e "${BOLD}s)${RESET} ${RED}Stop all running vLLM containers${RESET}"
     echo ""
-    echo -ne "${BOLD}Select model (1-5) or action (l/t/s):${RESET} "
+    echo -ne "${BOLD}Select model (1-6) or action (l/t/s):${RESET} "
     read model_choice
   fi
 
@@ -1216,6 +1222,96 @@ function vllm() {
       GPU_MEM_UTIL=0.95
       EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --mamba-backend flashinfer --mamba-cache-mode align --moe-backend marlin --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser nemotron_v3 --speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}')
       ;;
+    6)
+      # NVIDIA Nemotron 3.5 Bolt 74B-A9B "24GB": Mamba-2/Transformer hybrid
+      # LatentMoE (9B active) + C-RADIO vision tower, NVIDIA's own 2-bit QAT.
+      # Speculative decoding via its LiLiCorr DFlash drafter (separate repo,
+      # ~1 GB, W4A16 NVFP4). Added 2026-10-16, validated on b27.
+      #
+      # NEEDS b27+. The weights are ModelOpt MIXED_PRECISION: 27,728 layers
+      # IQ2_XXS (ggml 2-bit), 113 Q8_0, 80 W4A16_NVFP4. IQ2_XXS/Q8_0 only have
+      # b12x kernels (vLLM #59604, 2026-10-13), and need the `b12x` pip package,
+      # which the Dockerfile installs. b26 predates both. QUANTIZATION=
+      # modelopt_mixed routes those layers to b12x (as in config 5).
+      #
+      # Flags from NVIDIA's card recipe, and which ones are load-bearing:
+      # * VLLM_USE_V2_MODEL_RUNNER=1 (ENV_ARGS): REQUIRED, not cosmetic. With it
+      #   unset, vLLM counts a LiLiCorr draft as a V2-unsupported feature
+      #   ("DFlash candidate-head drafts", config/vllm.py), drops to the V1
+      #   runner, and V1 drafts with plain DFlash. The candidate head is
+      #   silently ignored and acceptance drops, with no error.
+      # * --linear-backend b12x --moe-backend b12x: the only kernels for these
+      #   codecs (auto would pick them too; explicit so a regression fails loud).
+      # * --trust-remote-code: the config classes (nemotron_h_omni/_puzzle) are
+      #   repo code. The model itself runs on vLLM's native implementation.
+      # * --mamba-{ssm-,}cache-dtype bfloat16: the card's choice (config.json
+      #   says float32 SSM). Halves the per-sequence Mamba state.
+      # * --mamba-cache-mode align: deprecated no-op on this build (prefix caching
+      #   implies it) but harmless; kept for parity with the recipe.
+      # Deviations from the recipe:
+      # * --reasoning-parser nemotron_v3 INSTEAD of the card's ultra_v3 plugin
+      #   file. The plugin overrides only non-streaming extract_reasoning (pi and
+      #   OpenClaw stream), while nemotron_v3 is built-in, engine-based, and has
+      #   the same enable_thinking=False / force_nonempty_content semantics. Same
+      #   <think>/<tool_call><function=...> template family as config 5.
+      # * --max-num-seqs 2 (recipe: 1). This config is tuned for 1-2 streams.
+      # * --limit-mm-per-prompt image 1, video 0. Video is skipped: it needs
+      #   decoder extras and a much larger encoder budget.
+      # * No --seed / --media-io-kwargs / --allowed-local-media-path.
+      #
+      # ---- MEASURED, b27, 2026-10-16 (laya NOT resident) ----
+      # Weights 23.52 GiB (target + drafter). Only 8 of 88 layers are attention
+      # (2 KV heads x 128) -> fp8 KV is ~4 KiB/token, so context is capped by
+      # max_position_embeddings (262144), not VRAM:
+      #   262144 ctx -> 334,491 tokens, 1.28x  (attention block size 4496)
+      # The pool moves with num_speculative_tokens (k=5 read 508,867 / 1.94x).
+      # Read the "GPU KV cache size" line; don't carry the figure across k.
+      # Idle 31,523 MiB. Stress: two concurrent ~120.6k-token needle prompts
+      # (both correct) peaked at 32,011 of 32,607 MiB, 0 restarts. A single
+      # 250,703-token prompt prefilled in 58s (4.3k tok/s), needle correct.
+      # Tool call, image input, streamed reasoning, and enable_thinking=false
+      # all verified.
+      #
+      # num_speculative_tokens 7 (= drafter block_size 8 - 1, the trained
+      # shape; also the card's value). Sweep: /tmp harness, 12 varied prompts
+      # x 1024 tokens, token-weighted:
+      #   k=7  c1 352 tok/s/stream (accept len 3.74)   c2 485 tok/s aggregate
+      #   k=5  c1 350 tok/s/stream (accept len 3.42)   c2 465 tok/s aggregate
+      # The drafter emits the whole block in one pass, so a larger k costs
+      # almost nothing. bench-inference.ts (short replies) reads ~524 tok/s
+      # mean at k=7.
+      #
+      # --max-num-batched-tokens is deliberately UNSET (spec decode caps
+      # scheduling at 2048; ignore the boot warning suggesting more). Larger
+      # prefill chunks cost activation memory, and the 262k context does not
+      # survive it. Both crash-looped at engine init with "KV cache is needed,
+      # which is larger than the available KV cache memory":
+      #   8192 -> 2.75 GiB available vs 5.05 GiB needed (max len 10,816)
+      #   4096 -> 3.47 GiB available vs 3.68 GiB needed (max len 220,304)
+      # i.e. the KV requirement for max_model_len grows with the chunk size on
+      # this hybrid. 2048 already prefills at 3-4.3k tok/s, so context won.
+      #
+      # GPU_MEM_UTIL 0.96: laya caps util at ~0.967 (see config 3), and nothing
+      # is gained above 0.96 except the 4096 chunk. RISK: the 32,011 MiB stress
+      # peak was measured WITHOUT laya. With its ~500 MiB resident only ~100 MiB
+      # would remain, so if this config ever OOMs mid-request while laya is up,
+      # drop util to 0.95 first (the pool still clears 262k at 1.28x minus ~300
+      # MiB, but re-measure).
+      #
+      # First boot ~590s: ~6 min is FlashInfer JIT (topk, XQA spec-dec variants,
+      # sink/SWA prefill for the drafter). The ~/.cache/flashinfer mount below
+      # persists it, and warm boots take ~190s.
+      MODEL_ID="nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB"
+      QUANTIZATION="modelopt_mixed"
+      CONTEXT_SIZE=262144
+      INPUT_MODES="text,image"
+      DOCKER_NAME="vllm_nemotron35_bolt_74b_a9b"
+      DOCKER_IMAGE="vllm-custom:latest"
+      CPU_OFFLOAD=0
+      GPU_MEM_UTIL=0.96
+      ENV_ARGS=(--env VLLM_USE_V2_MODEL_RUNNER=1 --env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+      EXTRA=(--trust-remote-code --enable-prefix-caching --kv-cache-dtype fp8 --linear-backend b12x --moe-backend b12x --attention-backend FLASHINFER --mamba-backend flashinfer --mamba-ssm-cache-dtype bfloat16 --mamba-cache-dtype bfloat16 --mamba-cache-mode align --max-num-seqs 2 --limit-mm-per-prompt '{"image":1,"video":0}' --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser nemotron_v3 --speculative-config '{"method":"dflash","model":"nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr","num_speculative_tokens":7,"rejection_sample_method":"standard","attention_backend":"FLASHINFER"}')
+      ;;
     logs|l)
       RUNNING_NAMES=$(docker ps --filter "name=vllm_" --format "{{.Names}}")
       if [ -n "$RUNNING_NAMES" ]; then
@@ -1449,10 +1545,17 @@ except Exception as e:
   # rebuild is still cold ONCE (new hashes) -- expect one crash+auto-restart on
   # the first `rec` after a build. Nothing evicts: ~200 MB per (build x config),
   # so `rm -rf ~/.cache/vllm` occasionally.
+  # -v ~/.cache/flashinfer: same idea for FlashInfer's JIT modules (2026-10-16).
+  # The image ships flashinfer-cubin but not flashinfer-jit-cache, so modules
+  # that aren't prebuilt (topk, XQA spec-dec variants, sink/SWA prefill...) are
+  # nvcc-compiled at startup into ~/.cache/flashinfer/<version>/ — ~6 min of
+  # config 6's first boot. Version-keyed dir, so sharing it is safe.
+  mkdir -p ~/.cache/flashinfer
   docker run -d --name $DOCKER_NAME --runtime nvidia --gpus all \
     --restart unless-stopped \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     -v ~/.cache/vllm:/root/.cache/vllm \
+    -v ~/.cache/flashinfer:/root/.cache/flashinfer \
     -v ~/scripts/chat-templates:/etc/vllm/chat-templates:ro \
     "${HF_ENV_ARGS[@]}" \
     "${ENV_ARGS[@]}" \
