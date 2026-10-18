@@ -79,7 +79,7 @@ RUN pip install --no-cache-dir transformers==5.19.0 && \
 # torchaudio/torchcodec/PyNvVideoCodec (NVIDIA torch stays) and numba patch skew.
 RUN pip install --no-cache-dir \
     'humming-kernels[cu13]==0.1.16' \
-    tokenspeed-mla==0.2.15 \
+    tokenspeed-mla==2.0.2 \
     tilelang==0.1.12 \
     compressed-tensors==0.17.0 \
     apache-tvm-ffi==0.1.11 \
@@ -147,6 +147,20 @@ RUN pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
     python3 -c "from quack.compile_utils import make_fake_tensor; import quack.layout_utils" && \
     python3 -c "import inspect, flashinfer; from flashinfer import BatchPrefillWithPagedKVCacheWrapper as W; assert 'kv_cache_sf' in inspect.signature(W.run).parameters, 'FlashInfer run() is missing kv_cache_sf — version skew with vLLM main'" && \
     python3 -c "import inspect; from flashinfer.decode import xqa_batch_decode_with_kv_cache as f; assert 'q_cu_seq_lens' in inspect.signature(f).parameters, 'FlashInfer xqa_batch_decode_with_kv_cache() is missing q_cu_seq_lens — version skew with vLLM main'" && \
+    python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
+
+# b12x: sm_120 cute-DSL GEMM/MoE kernels. An optional extra upstream
+# (setup.py `b12x`), so NOT in requirements/*.txt — the pin audit won't flag
+# it; track the version in setup.py. Needed by vllm.sh `6` (Nemotron 3.5 Bolt):
+# its ModelOpt IQ2_XXS/Q8_0 weights only have b12x kernels (#59604,
+# modelopt_block_quant.py). Pure-Python wheel; --no-deps because every dep
+# (cutlass-dsl 4.8.0 libs, tvm-ffi, cuda-python, rich, safetensors) is already
+# pinned above, and so its `torch>=2.12` can never pull stock torch.
+# The guard asserts vLLM's getters are non-None: vllm/utils/b12x.py SWALLOWS
+# submodule ImportErrors (returns None), so a missing transitive dep would
+# otherwise only show at model load as "...require b12x on SM12x".
+RUN pip install --no-cache-dir --no-deps b12x==1.5.1 && \
+    python3 -c "import vllm.utils.b12x as u; assert 'iq2_xxs' in u.B12X_BLOCK_CODECS; missing = [m for m, v in u._B12X_SUBMODULES.items() if v is None]; assert not missing, f'b12x submodules failed to import: {missing}'; import vllm.model_executor.layers.quantization.modelopt_block_quant" && \
     python3 -c "import torch; assert 'nv' in torch.__version__, f'NVIDIA torch got clobbered: {torch.__version__}'"
 
 # K2-Horizon MoVA INT4 (vllm.sh `2`): cyankiwi fork commit 46485cf572 minus its
