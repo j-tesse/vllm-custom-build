@@ -56,8 +56,9 @@ DOCKER_IMAGE="vllm/vllm-openai:latest"
 CMD_PREFIX=()
 
 function sync_agent_models() {
-  # Point BOTH agents — pi (~/.pi/agent) and OpenClaw (~/.openclaw/openclaw.json)
-  # — at the model we just started, by delegating to update-agent-models.sh.
+  # Point every agent — pi (~/.pi/agent), OpenClaw (~/.openclaw/openclaw.json)
+  # and Aider (~/.aider.conf.yml) — at the model we just started, by delegating
+  # to update-agent-models.sh.
   #
   # Call this AFTER wait_for_healthy, never before: that script reads the id and
   # max_model_len actually being SERVED from /v1/models, which is the truth even
@@ -71,7 +72,7 @@ function sync_agent_models() {
   local sync=~/scripts/update-agent-models.sh
   [ -x "$sync" ] || return 0
   INPUT_MODES="$input_modes" CONTEXT_WINDOW="$ctx" "$sync" \
-    || echo "Warning: agent model sync failed — pi/OpenClaw configs left unchanged."
+    || echo "Warning: agent model sync failed — agent configs left unchanged."
 }
 
 function log_vllm_concurrency() {
@@ -983,7 +984,7 @@ function vllm() {
       CPU_OFFLOAD=0
       GPU_MEM_UTIL=0.982
       ENV_ARGS=(--ulimit memlock=-1:-1)
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 6 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
       ;;
     4m)
       # RedHatAI Gemma 4 31B NVFP4 + MTP speculative decoding via Google's drafter
