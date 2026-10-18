@@ -151,9 +151,10 @@ RUN pip install --no-cache-dir --extra-index-url https://flashinfer.ai/whl/ \
 
 # b12x: sm_120 cute-DSL GEMM/MoE kernels. An optional extra upstream
 # (setup.py `b12x`), so NOT in requirements/*.txt — the pin audit won't flag
-# it; track the version in setup.py. Needed by vllm.sh `6` (Nemotron 3.5 Bolt):
-# its ModelOpt IQ2_XXS/Q8_0 weights only have b12x kernels (#59604,
-# modelopt_block_quant.py). Pure-Python wheel; --no-deps because every dep
+# it; track the version in setup.py. Added for Nemotron 3.5 Bolt,
+# whose IQ2_XXS/Q8_0 weights only have b12x kernels (#59604,
+# modelopt_block_quant.py). Bolt was removed from vllm.sh on 2026-10-17, so no
+# config uses b12x now. This block can be dropped. Pure-Python wheel; --no-deps because every dep
 # (cutlass-dsl 4.8.0 libs, tvm-ffi, cuda-python, rich, safetensors) is already
 # pinned above, and so its `torch>=2.12` can never pull stock torch.
 # The guard asserts vLLM's getters are non-None: vllm/utils/b12x.py SWALLOWS
