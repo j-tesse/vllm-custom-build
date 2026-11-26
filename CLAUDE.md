@@ -14,7 +14,7 @@ Documentation must be kept in sync and useful. Use terse language, avoid fluffy 
 
 We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidia/vllm` container so we can track bleeding-edge vLLM (features/fixes ahead of any NVIDIA release) while keeping NVIDIA's Blackwell-tuned CUDA/PyTorch runtime. The official `vllm/vllm-openai:latest` image lags and its CUDA/torch combo isn't matched to the RTX 5090 + our driver, so a custom build is needed to reconcile NVIDIA's base torch with the newer vLLM source and its CUDA-extension deps.
 
-> **HISTORY:** The original rationale (below, kept for context) was about **driver 580.x**, which capped at CUDA 13.0 and forced an `nvcc 13.0` override + the `26.03` base pin. The driver is now **610.43.02 (CUDA 13.3)**, so on **2026-07-17** the base was bumped to **`26.06-py3`** (torch 2.13, CUDA 13.3) and all the driver-580 workarounds were deleted — see "Base image (26.06)" below. The paragraphs that follow describe the retired 580.x constraints.
+> **HISTORY:** The original rationale (below, kept for context) was about **driver 580.x**, which capped at CUDA 13.0 and forced an `nvcc 13.0` override + the `26.03` base pin. On **2026-07-17** (driver 610, CUDA 13.3) the base was bumped to **`26.06-py3`** and the driver-580 workarounds were deleted. On **2026-11-26** (driver 620.70.10, CUDA 13.5) it was bumped again to **`26.11-py3`** because upstream moved to torch 2.14. The base's CUDA version must not exceed the driver's UMD version (`nvidia-smi` header), because GeForce cards get no forward-compat. The paragraphs that follow describe the retired 580.x constraints.
 >
 > _(Retired 580.x rationale)_ The official image used CUDA 12.9, incompatible with driver 580.x; standard PyTorch cu130 triggered forward-compat error 803. Driver 580.x needed the CUDA 13.1 runtime (only in NVIDIA's internal PyTorch), vLLM's CUDA extensions needed full dev headers absent from the NVIDIA container, and nvcc 13.1 generated PTX driver 580.x couldn't run — so we substituted the CUDA 13.0 compiler.
 
@@ -23,7 +23,7 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | Component | Details |
 |-----------|---------|
 | GPU | RTX 5090 (Blackwell, sm_120) |
-| Driver | 610.43.02 (CUDA 13.3 runtime; UMD 13.3) |
+| Driver | 620.70.10 (CUDA UMD 13.5) |
 | CPU | Ryzen 9 9900X (12-core / 24 threads) |
 | RAM | ~91 GB |
 
@@ -34,8 +34,9 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | `update.sh` | Updates `vllm/` to latest upstream (fast-forward only) and kicks off an async build. Automates the mechanical part of `/latest`; does **not** watch or fix the build |
 | `build-async.sh` | **Preferred build script** — detaches from terminal, survives SSH disconnects |
 | `build.sh` | Synchronous build script (called internally by `build-async.sh`) |
-| `Dockerfile` | 2-stage Dockerfile, base `26.06-py3` (see below) |
-| `Dockerfile.26.03` | Archived previous 3-stage build (driver-580.x era); kept for reference/rollback |
+| `Dockerfile` | 2-stage Dockerfile, base `26.11-py3` (see below) |
+| `Dockerfile.26.06` | Archived 26.06 build (b14–b27). Rollback: `cp` it back + reset `vllm/` to `77154ca6116` |
+| `Dockerfile.26.03` | Archived 3-stage build (driver-580.x era); kept for reference |
 | `PLAN-base-26.06.md` | Base-bump plan + measured dependency audit |
 | `k2_horizon_mova_int4.patch`, `k2_horizon_mova_int4_compile.patch` | Fork patch + our torch.compile fix, applied to site-packages in the runtime stage; let `vllm.sh 2` serve INT4 MoVA value experts. See below |
 | `vllm/` | vLLM source, tracked as a **git submodule** → `github.com/vllm-project/vllm` (pins the built commit) |
@@ -45,19 +46,24 @@ We build vLLM **from current upstream source** on top of NVIDIA's `nvcr.io/nvidi
 | `bench-inference.ts` | Inference benchmark against a **running** server (TTFT, decode tok/s, MTP acceptance). Node-native TS, no deps. Appends each run to `bench-results/bench.jsonl`; `--report` prints the saved history as a table |
 | `bench-results/` | Gitignored benchmark history (JSONL, one record per run). Read it with `bench-inference.ts --report` |
 
-## Dockerfile strategy (2 stages, base `26.06-py3`)
+## Dockerfile strategy (2 stages, base `26.11-py3`)
 
-1. **`builder`** — starts from `nvcr.io/nvidia/vllm:26.06-py3` (torch 2.13, CUDA 13.3) and builds vLLM from current source into a wheel using the base's **native nvcc 13.3**.
-2. **Runtime** — fresh `nvcr.io/nvidia/vllm:26.06-py3` base, installs the wheel (`--no-deps` to preserve NVIDIA's custom torch), then pins the handful of runtime deps that current source needs newer than the base's vLLM 0.22.1.
+1. **`builder`** — starts from `nvcr.io/nvidia/vllm:26.11-py3` (torch 2.15.0a0, CUDA 13.5) and builds vLLM from current source into a wheel using the base's native nvcc.
+2. **Runtime** — fresh `26.11-py3` base, installs the wheel (`--no-deps` to preserve NVIDIA's custom torch), then pins the few runtime deps where source differs from the base's vLLM 0.33.0.
 
-> **26.03 → 26.06 bump (2026-07-17):** the old `cuda-devel` stage + nvcc-13.0 override, the `register_opaque_type` hoist sed, and the `cuda_view.cu` patch were all **deleted** — verified unnecessary on torch 2.13 / driver 610. The previous 3-stage 26.03 Dockerfile is archived as `Dockerfile.26.03`; see `PLAN-base-26.06.md` for the measured dep audit. Validated by building b14 and serving `vllm.sh 2` (Qwen NVFP4 MoE + MTP) end-to-end.
+> **26.06 → 26.11 bump (2026-11-26, b28):** upstream main requires torch 2.14 (since `30e79c3a766`, #52183). Against 26.06's torch 2.13, DeepGEMM failed to compile (`TORCH_VERSION_2_14_0`, `torch::stable::permute`/`index_select`/`bitwise_*` missing). 26.11 ships torch **2.15.0a0**; source pins `torch==2.14.0`, but the stable ABI is additive, so it builds. Only the ignorable pip resolver warning remains. Driver 620.70.10 (UMD 13.5) made the CUDA 13.5 base usable; 26.07–26.10 would also have needed a driver newer than 610.
+> **Not a bug:** CUDA builds no longer produce `vllm/_C.abi3.so`. The ops live in `_C_stable_libtorch` + `_moe_C_stable_libtorch`. The `Failed to import from vllm._C` line in build.log comes from the CPU-platform probe, because no GPU is visible during `docker build`.
+> **Image size:** ~54 GB, up from ~15 GB, because the 26.11 base alone is 40 GB.
+> **26.03 → 26.06 (2026-07-17, b14):** deleted the cuda-devel stage, nvcc override, hoist sed and `cuda_view.cu` patch. See `PLAN-base-26.06.md` and the section at the end.
 
-### Pins the runtime stage still needs (source ahead of 26.06's vLLM 0.22.1)
-Because we build bleeding-edge source on a base tuned for 0.22.1, these stay pinned (guards fail-fast if a symbol/torch regresses). **The Dockerfile is the source of truth for versions**; as of b27: `transformers==5.19.0`, `xgrammar==0.2.8`, `flashinfer-python/-cubin==0.7.0.post1` (+`--extra-index-url https://flashinfer.ai/whl/`), `humming-kernels==0.1.16`, `nvidia-cutlass-dsl==4.8.0` + `quack-kernels==0.6.5` (matched cute-DSL pair), `tokenspeed-mla==2.0.2`, `b12x==1.5.1`, plus tilelang, tvm-ffi, compressed-tensors, and common.txt floors (hf_hub, tokenizers, mcp 2.x, oss-harmony, instanttensor, …).
+### Pins the runtime stage still needs (b28, base 26.11)
+**The Dockerfile is the source of truth.** As of b28: `humming-kernels[cu13]==0.1.20`, `tilelang==0.1.12` (a *downgrade*: base has 0.1.13), `compressed-tensors==0.20.1`, `xgrammar==0.2.9`, `flashinfer-python/-cubin==0.7.4` (+`--extra-index-url https://flashinfer.ai/whl/`, + the load-bearing `nvidia-cutlass-dsl[cu13]==4.8.0` repeat). The base already satisfies transformers (5.20.2), cutlass-dsl 4.8.0 + quack 0.6.5, tokenspeed-mla 2.0.3, tvm-ffi 0.1.11 and every common.txt floor. Those pins were dropped, but their **guards stay**, so a base that regresses one fails at build time.
 
-**`b12x` is invisible to the pin audit.** It is a `setup.py` optional extra, not a line in `requirements/*.txt`, so diff `setup.py`'s `"b12x": [...]` by hand on every update. No current `vllm.sh` config uses it: it was added for Nemotron Bolt (IQ2_XXS/Q8_0 weights, no other kernels), a config that was removed on 2026-10-17. It can be dropped at the next rebuild. Its guard asserts vLLM's `_B12X_SUBMODULES` are all non-None, because `vllm/utils/b12x.py` swallows import errors.
+**flashinfer-jit-cache trap (26.11):** the base ships 9 `flashinfer-jit-cache[-smXX]` wheels (NVIDIA 0.7.2 builds). They all have to be uninstalled, *and* the leftover `dist-packages/flashinfer_jit_cache/` dir has to be `rm -rf`ed. pip leaves an empty `providers/` subdir behind, which still imports as a namespace package; `flashinfer/jit/env.py` then dies at `import flashinfer` on `flashinfer_jit_cache.__version__`. The first b28 attempt failed exactly this way.
 
-**Upstream main moved to torch 2.14 on 2026-10-14 (`30e79c3a766`, #52183); our 26.06 base ships torch 2.13.** b27 is therefore pinned to `77154ca6116`, the nightly named by NVIDIA's Bolt card (Bolt has since been removed from `vllm.sh`). It sits just before the torch bump. A plain `./update.sh` would fast-forward past it. Before doing that, decide how to handle torch 2.14: a newer NVIDIA base, or verifying that the CUDA extensions still build and load against 2.13. Expect that to be a base-bump-sized job, not a routine update.
+**b12x dropped at b28:** source's `setup.py` `"b12x"` extra is now `[]`, and no config uses it.
+
+**`vllm/` is no longer pinned behind main.** Since b28, `./update.sh` fast-forwards normally again (b27's `77154ca6116` pin existed only because of the torch 2.14 skew).
 
 **Audit every pin on every `vllm/` update, not just flashinfer.** b25 (2026-10-12) built clean but every config crash-looped at config load (`humming.dtypes has no attribute float4e0m3`) because a large upstream jump moved ~20 requirements past our pins. The fix is runtime-stage only (builder stays cached, ~4 min rebuild). Audit: inside the built image, check each line of `vllm/requirements/{common,cuda}.txt` with `packaging.Requirement(...).specifier.contains(importlib.metadata.version(name))`; expected leftover skew is only torch/torchvision/torchaudio/torchcodec/PyNvVideoCodec (NVIDIA torch, deliberately kept) and numba patch versions.
 
@@ -68,12 +74,15 @@ Upstream `k2_horizon.py` supports only bf16 MoVA value experts (`self_attn.v_exp
 - `k2_horizon_mova_int4_compile.patch` is ours and applies on top of the fork patch. The fork picks its int4 tile config per call (`try_get_optimal_moe_config`: JSON reads + NVML), which Dynamo can't trace under vLLM's fullgraph compile, so EngineCore died in profile_run (`_FuncPtr.__call__`). The fix moves that path into the opaque custom op `torch.ops.vllm.k2_horizon_mova_int4`. Validated on b24 (2026-09-28).
 - Applied with `patch --forward` against **site-packages in the runtime stage**, not in the builder. Both files are pure Python, and this placement lets a patch-only change reuse the cached builder layers (the CUDA compile).
 - **On a `vllm/` update the patch may reject, and the build then fails loudly (intended).** Check whether upstream has merged an equivalent first. If it has, delete the block and the patch file. If it hasn't, rebase both patches onto the new source.
+- Last rebased on 2026-11-26 onto `46e324e5827` (b28): offsets only, regenerated so both patches apply at `-F0`. Upstream still has no CUDA equivalent.
 
 ## Transformers pin (load-bearing) & Gemma 4 MTP
 
-The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's CUDA 13.1 torch), so **transformers is never pulled as a wheel dependency** — the version is whatever the explicit `RUN pip install transformers==<X>` line sets. Removing that line leaves the base image's transformers **4.57.5**, which is 4.x and doesn't recognize the `gemma4` architecture at all → every Gemma 4 config breaks at model load. The pin is required for all Gemma 4 options, not optional.
+The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's torch), so **transformers is never pulled as a wheel dependency**: the base image's version is what you get unless the Dockerfile pins one.
 
-**Pinned to `transformers==5.19.0`** (5.12.1 from 2026-07-02 until b26; source now requires >=5.16.1,<5.20) to enable Gemma 4 MTP:
+**As of b28 (base 26.11) there is no pin.** The base ships **5.20.2**, which is inside source's `>=5.16.1,<5.25` and has `gemma4_assistant`. The Dockerfile keeps the `CONFIG_MAPPING` guard. If a future base or source range breaks this, re-add `pip install transformers==<X>`. History: pinned 5.12.1 (2026-07-02) → 5.19.0 (b26–b27), because 26.03/26.06 shipped 4.57.5/5.6.0, which lack Gemma 4 / `gemma4_assistant`.
+
+Gemma 4 MTP needs it:
 
 - Gemma 4 MTP (Multi-Token Prediction) speculative decoding uses Google's drafter `google/gemma-4-31B-it-assistant` (~0.5B), enabled by `vllm.sh` configs **`4m`** (105k ctx) and **`4`** (the same stack at 90k ctx + a 24 GiB host-RAM KV tier; see below), with a KV budget sized so the drafter weights fit at gpu-mem-util 0.982. **`vllm.sh`'s `4m` block is the source of truth for these numbers — it carries the full dated tuning log. Do not trust figures quoted here over that block.** Current: `CONTEXT_SIZE=105000` with `--num-gpu-blocks-override 6780`.
   - **The tuning lever changed on 2026-08-03.** Before that, the KV pool was whatever vLLM's profiler handed out and the only lever was trimming `CONTEXT_SIZE` under it. Since then the pool is **pinned** by `--num-gpu-blocks-override`, deliberately claiming more than the profiler offers (the profiler under-estimates because the torch.compile working set is still resident when the peak is measured) and making warm and cold boots identical. So **re-tuning now means adjusting the block override, not just lowering context.**
@@ -84,7 +93,6 @@ The runtime stage installs the vLLM wheel with `--no-deps` (to preserve NVIDIA's
 - The drafter's `config.json` has `model_type: gemma4_assistant`. vLLM does **not** register this in its config registry (true even on upstream main) — it relies on **transformers** to recognize it, and that model_type only landed in **transformers 5.12.x**. `5.7.0` does NOT have it (despite the drafter stamping `5.7.0.dev0`); with anything <5.12 the engine crashes at config load: "Transformers does not recognize `gemma4_assistant`".
 - Validated 2026-07-02: 5.12.1 boots cleanly against our wheel, preserves NVIDIA's torch, and drives the drafter at ~80–91% draft acceptance (mean accept length ~1.8 → near ~1.8× decode). MTP is text-only (drafter has no vision tower); image prompts still run on the target.
 
-**The 26.06 base does NOT fix this** — it ships **transformers 5.6.0** (below 5.12.1, no `gemma4_assistant`), so the explicit `transformers==5.12.1` pin is still required after the base bump. (The base bump itself was done on 2026-07-17 and did retire the nvcc override / `cuda_view.cu` / hoist patches — see "Dockerfile strategy" above — but the transformers pin is independent of the base and stays.)
 
 ## DiffusionGemma (`vllm.sh` `3` / `3n`) — the one config with a constrained *request* shape
 
