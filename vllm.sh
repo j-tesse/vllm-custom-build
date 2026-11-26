@@ -542,12 +542,20 @@ function vllm() {
       DOCKER_NAME="vllm_qwen_3_8_qat"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      # 0.976 since b28 (2026-11-26) == the old 0.982, same physical footprint.
+      # The "0.982"/"0.983" figures in the notes below are on the OLD scale (subtract
+      # 0.006). Reason: vLLM #61044 now creates cuBLAS handles (~0.19 GiB) BEFORE the
+      # startup snapshot, so they moved out of the budget into the baseline. With
+      # every vLLM container stopped, b28 reaches the startup check with 30.67 of
+      # 31.38 GiB free, so 0.982 dies instantly ("Free memory ... on startup is less
+      # than desired"). Max bootable is ~0.977. This assumes the Dockerfile's
+      # TORCH_DIST_USE_NCCL2=0; without it, eager NCCL comms take another ~3 GiB.
+      GPU_MEM_UTIL=0.976
       EXTRA=(--enable-prefix-caching --kv-cache-dtype bfloat16 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --chat-template /etc/vllm/chat-templates/qwen3_8-patched.jinja --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
     1c)
       # Same as option 1 but with maximized context (228K of the 256K native).
-      # Native MTP + 0.982 util ceiling as in option 1 (see notes there).
+      # Native MTP + 0.976 util ceiling as in option 1 (see notes there).
       MODEL_ID="unsloth/Qwen3.8-27B-NVFP4"
       QUANTIZATION="compressed-tensors"
       CONTEXT_SIZE=228000
@@ -555,7 +563,7 @@ function vllm() {
       DOCKER_NAME="vllm_qwen_3_8_228k"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      GPU_MEM_UTIL=0.976
       EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
     1k)
@@ -609,7 +617,7 @@ function vllm() {
       DOCKER_NAME="vllm_qwen_3_8_bf16kv"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      GPU_MEM_UTIL=0.976
       EXTRA=(--enable-prefix-caching --kv-cache-dtype bfloat16 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser qwen3_coder --reasoning-parser qwen3 --speculative-config '{"method":"mtp","num_speculative_tokens":4}')
       ;;
     2)
@@ -869,6 +877,16 @@ function vllm() {
       # re-derive --num-gpu-blocks-override from a COLD boot after ANY image bump.
       # This override is DELIBERATELY LOWER than 4m's (6400 vs 6780) and must NOT
       # be synced to it: this config runs without expandable_segments (see below).
+      # UNITS CHANGED at b28/b29 (2026-11-26): upstream #63231 moved the default
+      # --block-size from 16 to 64, so one block is now 4x the tokens and bytes
+      # (~5.0 MiB, was ~1.22). Block counts in the history below are 16-token
+      # blocks; divide by 4. 6400 (16-tok) unchanged == 1600 now. Left at 6400,
+      # b29 tried to allocate 31.25 GiB of KV and OOMed at startup.
+      # RE-VALIDATED on b29 (2026-11-26) at 1530 (64-tok) blocks: 96,361 tokens
+      # (1.07x @ 90k), idle 30,624 MiB, stress peak 31,682 MiB, 457 MiB free after,
+      # 0 OOM / 0 restarts, 88k RAM reload 0.5s. 1600 also passed but peaked at
+      # 32,032 MiB with only 107 MiB left (b29's non-KV footprint is ~350 MiB
+      # above b26's), so it was trimmed 70 blocks to restore b26's margin.
       # (2026-09-10: replaced the old nvidia/Gemma-4-31B-IT-NVFP4 CPU_OFFLOAD=4
       # config, whose weights barely fit the card — recover it from git history.)
       #
@@ -982,9 +1000,9 @@ function vllm() {
       DOCKER_NAME="vllm_gemma4-31b-nvfp4-mtp-ram"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      GPU_MEM_UTIL=0.976
       ENV_ARGS=(--ulimit memlock=-1:-1)
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 6 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6400 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 6 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":5}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 1530 --kv-transfer-config '{"kv_connector":"SimpleCPUOffloadConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":25769803776}}')
       ;;
     4m)
       # RedHatAI Gemma 4 31B NVFP4 + MTP speculative decoding via Google's drafter
@@ -1069,6 +1087,14 @@ function vllm() {
       # --kv-cache-memory=8710538839"); 6780 gives that ~266 MiB back, covering
       # the 168 MiB alloc with margin.
       #
+      # UNITS CHANGED at b28/b29 (2026-11-26): upstream #63231 moved the default
+      # --block-size 16 -> 64, so every block count in this log is in 16-token
+      # blocks: divide by 4. 6780 (16-tok) == 1695 now (same bytes, same pool).
+      # Set to 1625 (b29), NOT yet validated: config 4 measured b29's non-KV
+      # footprint ~350 MiB above b26's and needed a 70-block trim to keep its
+      # margin, so 4m gets the same trim by analogy. Cold-boot and stress-test
+      # before trusting it.
+      #
       # MEASURED on the cold boot (b21, 2026-09-09), not extrapolated:
       #   6780 blocks -> 115,437 tokens, 1.10x at 105,000 ctx (17.03 tok/blk)
       #   device usage 31542 -> 31262 MiB idle, i.e. 280 MiB actually reclaimed
@@ -1088,9 +1114,9 @@ function vllm() {
       DOCKER_NAME="vllm_gemma4-31b-nvfp4-mtp"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      GPU_MEM_UTIL=0.976
       ENV_ARGS=(--env "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
-      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 6780)
+      EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}' --kernel-config '{"enable_flashinfer_autotune":false}' --num-gpu-blocks-override 1625)
       ;;
     4mc)
       # High-context turbo: LilaRest turbo (modelopt_fp4, TEXT-ONLY), NOT the
@@ -1111,7 +1137,7 @@ function vllm() {
       DOCKER_NAME="vllm_gemma4-31b-nvfp4-mtp-hc"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.982
+      GPU_MEM_UTIL=0.976
       EXTRA=(--enable-prefix-caching --kv-cache-dtype fp8 --max-num-batched-tokens 2560 --max-num-seqs 1 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":4}')
       ;;
     4f)
@@ -1126,7 +1152,7 @@ function vllm() {
       DOCKER_NAME="vllm_gemma4-31b-nvfp4-mtp-fp4kv"
       DOCKER_IMAGE="vllm-custom:latest"
       CPU_OFFLOAD=0
-      GPU_MEM_UTIL=0.983
+      GPU_MEM_UTIL=0.977
       EXTRA=(--enable-prefix-caching --kv-cache-dtype nvfp4 --kv-cache-dtype-skip-layers sliding_window --max-num-batched-tokens 4096 --max-num-seqs 2 --enable-auto-tool-choice --tool-call-parser gemma4 --reasoning-parser gemma4 --chat-template /etc/vllm/chat-templates/gemma4-force-think.jinja --speculative-config '{"method":"mtp","model":"google/gemma-4-31B-it-assistant","num_speculative_tokens":1}')
       ;;
     5)

@@ -168,5 +168,18 @@ RUN cd /usr/local/lib/python3.12/dist-packages && \
 COPY --from=builder /workspace/vllm-build/examples /workspace/examples
 COPY --from=builder /workspace/vllm-build/benchmarks /workspace/benchmarks
 
+# torch 2.15's default "nccl" backend (ProcessGroupNCCL2, torchcomms) creates the
+# NCCL communicator EAGERLY at new_group(). The legacy ProcessGroupNCCL defers
+# that to the first collective. At world_size=1 vLLM never runs one, but it builds
+# ~7 groups (world/tp/pp/dp/ep/pcp/dcp), and NCCL 2.32 spends ~384 MiB on each
+# (64 channels x 3 tiny allocs x 2 MiB granule). That is ~3 GiB gone BEFORE the
+# startup free-memory check, so every 0.98x config died with "Free memory on
+# device (27.83/31.38 GiB) on startup is less than desired" (b28, 2026-11-26).
+# Legacy = 0 bytes, i.e. b27 behavior. NCCL_* knobs (MAX_NCHANNELS, CUMEM_ENABLE)
+# only trim it. Guard: fail the build if this torch stops honoring the var.
+ENV TORCH_DIST_USE_NCCL2=0
+RUN grep -q 'environ.get("TORCH_DIST_USE_NCCL2") == "0"' \
+        /usr/local/lib/python3.12/dist-packages/torch/distributed/distributed_c10d.py
+
 ENV VLLM_USAGE_SOURCE=production-docker-image
 ENTRYPOINT ["vllm", "serve"]
