@@ -1,55 +1,7 @@
-From 46485cf572920a2bbe55c1522f06237e9bc9aee0 Mon Sep 17 00:00:00 2001
-From: toncao <130689535+toncao@users.noreply.github.com>
-Date: Fri, 11 Sep 2026 10:14:22 +0000
-Subject: [PATCH] K2-Horizon: serve quantized MoVA value experts
- (self_attn.v_experts.*)
-
-K2HorizonMoVAAttention builds v_experts as ColumnParallelLinear *with*
-quant_config, so a compressed-tensors checkpoint that quantizes
-self_attn.v_experts.* loads fine, but compute_mova_v_sparse then stacks
-`expert.weight`, which only exists on unquantized layers:
-
-  AttributeError: 'ColumnParallelLinear' object has no attribute 'weight'
-
-This aborts during profile_run, so any such checkpoint is unservable.
-
-Rather than dequantizing to bf16 (which would forfeit the memory saving --
-7.55B params, 4.25 GB int4 vs 15.1 GB bf16 for a 36B-A4B checkpoint), fold the
-packed experts once after load into the layout the existing use_int4_w4a16
-Triton/CUDA path already accepts:
-
-  w1       -> [E, N, K // 2] uint8, low nibble = even k
-  w1_scale -> [E, N, K // group]
-  w1_zp    -> [E, N // 2, K // group] uint8, packed along N
-
-compressed-tensors packs 8 values per int32 sequentially along K with
-little-endian nibbles and a +8 storage bias, so weight_packed viewed as uint8
-is already the required byte layout; only the zero points (packed along N)
-need unpacking and re-packing. Symmetric checkpoints pass w1_zp=None, whose
-default bias of 8 matches that same storage bias.
-
-The tile config is selected per call for this path: the wna16 CUDA/Triton
-choice is made from the actual token count, and the CUDA kernel caps
-BLOCK_SIZE_M at 64, so a config cached for max_num_batched_tokens aborts.
-
-Also fix _ensure_block_size_k_divisible, which could return a BLOCK_SIZE_K
-whose ratio to group_size is rejected by moe_wna16.cu (it requires
-BLOCK_SIZE_K // group_size in [1, 2, 4, 8]). It stepped through every multiple
-of group_size, so size_k=2560 with group_size=128 returned 640 (ratio 5), and
-the block growth heuristics could propose 512 with group_size=32 (ratio 16).
-Candidates are now exactly group_size * {8, 4, 2, 1}; already-legal inputs are
-unchanged. This mostly affects finer-grained (group_size=32) checkpoints.
-
-Verified on K2-Horizon-MoVA-36B-A4B-OmniQuant-INT4-DDP (group_size=32, asym):
-serves coherently, 26.58 GiB weights+non-torch for a 22.58 GiB checkpoint,
-confirming the experts stay packed. The converted kernel path matches a bf16
-dequantized reference to 4.9e-04 max abs on real checkpoint tensors.
----
-diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
-index dc619b2b12d2..735a76834fa9 100644
+diff -ruN a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
 --- a/vllm/model_executor/layers/fused_moe/fused_moe.py
 +++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
-@@ -1178,7 +1178,8 @@ def _ensure_block_size_k_divisible(
+@@ -1361,7 +1361,8 @@
      """Ensure block_size_k is a divisor of size_k and divisible by group_size.
  
      This ensures BLOCK_SIZE_K compatibility with MoeWNA16 CUDA kernel which
@@ -59,9 +11,9 @@ index dc619b2b12d2..735a76834fa9 100644
  
      Args:
          size_k: The size_k dimension that must be divisible by result.
-@@ -1188,21 +1189,20 @@ def _ensure_block_size_k_divisible(
-     Returns:
+@@ -1372,21 +1373,20 @@
          A valid BLOCK_SIZE_K that divides size_k and is divisible by group_size.
+ 
      """
 -    # Fast path: already valid
 -    if size_k % block_size_k == 0 and block_size_k % group_size == 0:
@@ -94,11 +46,10 @@ index dc619b2b12d2..735a76834fa9 100644
              return candidate
  
      # Fallback: if group_size divides size_k, use it
-diff --git a/vllm/model_executor/models/k2_horizon.py b/vllm/model_executor/models/k2_horizon.py
-index 47e87c0dcb62..0ad6abeb88f9 100644
+diff -ruN a/vllm/model_executor/models/k2_horizon.py b/vllm/model_executor/models/k2_horizon.py
 --- a/vllm/model_executor/models/k2_horizon.py
 +++ b/vllm/model_executor/models/k2_horizon.py
-@@ -797,6 +797,90 @@ def __init__(
+@@ -872,6 +872,90 @@
              block_shape=None,
          )
  
@@ -189,7 +140,7 @@ index 47e87c0dcb62..0ad6abeb88f9 100644
      def compute_mova_v_sparse(self, hidden_states):
          router_logits, _ = self.v_router(hidden_states)
  
-@@ -808,6 +892,45 @@ def compute_mova_v_sparse(self, hidden_states):
+@@ -883,6 +967,45 @@
              scaling_factor=self.router_scaling_factor,
          )
  
@@ -235,7 +186,7 @@ index 47e87c0dcb62..0ad6abeb88f9 100644
          w1 = torch.stack(
              [expert.weight for expert in self.v_experts], dim=0
          ).contiguous()
-@@ -1439,7 +1562,13 @@ def compute_logits(
+@@ -1540,7 +1663,13 @@
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
          loader = AutoWeightsLoader(self)

@@ -1,6 +1,7 @@
+diff -ruN b/vllm/model_executor/models/k2_horizon.py c/vllm/model_executor/models/k2_horizon.py
 --- a/vllm/model_executor/models/k2_horizon.py
 +++ b/vllm/model_executor/models/k2_horizon.py
-@@ -102,6 +102,7 @@
+@@ -104,6 +104,7 @@
  )
  from vllm.sequence import IntermediateTensors
  from vllm.triton_utils import tl
@@ -8,7 +9,7 @@
  
  logger = init_logger(__name__)
  
-@@ -277,6 +278,78 @@
+@@ -362,6 +363,78 @@
      return out_hidden_states
  
  
@@ -87,7 +88,7 @@
  class K2HorizonRMSNorm(RMSNorm):
      def __init__(self, hidden_size: int, n_groups: int, eps: float = 1e-6):
          assert hidden_size % n_groups == 0
-@@ -802,10 +875,14 @@
+@@ -877,10 +950,14 @@
          self._mova_w1_shape = w1_shape
          self._mova_config_M = vllm_config.scheduler_config.max_num_batched_tokens
          self._mova_config_dtype = vllm_config.model_config.dtype
@@ -105,7 +106,7 @@
  
      def pack_quantized_v_experts(self) -> bool:
          """Fold packed-int4 MoVA value experts into fused-MoE kernel layout.
-@@ -893,42 +970,18 @@
+@@ -968,42 +1045,18 @@
          )
  
          if self.v_experts_qweight is not None:

@@ -4,18 +4,17 @@
 # vLLM Custom Docker Image Build Script
 ################################################################################
 #
-# Builds vLLM v0.17.1 with CUDA 13.0.1 support optimized for RTX 5090
+# Builds vLLM from vllm/ source for the RTX 5090
 #
 # System Requirements:
-# - NVIDIA Driver 580.105.08 (CUDA 13.0 runtime)
+# - NVIDIA Driver 620.70.10 (CUDA 13.5 UMD)
 # - GPU: RTX 5090 (Blackwell architecture, compute 12.0)
 # - CPU: 12-core Ryzen 9 9900X (24 threads)
 # - RAM: 91GB available
 # - Disk: ~40GB free for build cache
 #
 # Build Configuration:
-# - Base Image: nvidia/cuda:13.0.1-devel-ubuntu22.04
-# - Runtime Image: nvidia/cuda:13.0.1-base-ubuntu22.04
+# - Base + Runtime Image: nvcr.io/nvidia/vllm:26.11-py3 (see Dockerfile)
 # - CUDA Arch: 12.0 only (RTX 5090 optimized)
 # - Max Jobs: 16 (leaves 8 threads for system)
 # - Expected Time: 45-75 minutes
@@ -62,7 +61,7 @@ echo "  Build Number: $BUILD_NUMBER (previous: $LAST_BUILD_NUMBER)"
 echo "  Tags:         vllm-custom:$NUMBER_TAG"
 echo "                vllm-custom:$VERSION_TAG"
 echo "                vllm-custom:latest"
-echo "  Base Image:   nvcr.io/nvidia/vllm:26.06-py3 (CUDA 13.3, torch 2.13)"
+echo "  Base Image:   nvcr.io/nvidia/vllm:26.11-py3 (CUDA 13.5, torch 2.15a0)"
 echo "  Target Arch:  Blackwell (compute 12.0)"
 echo "  Max Jobs:     16"
 echo "  Build Time:   ~30-60 minutes"
